@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+  namespace: devsecops-login
+data:
+  init.sql: |-
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(50) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL
+    );
+
+    -- Optional: Insert default user if needed
+    -- INSERT INTO users (username, password) VALUES ('test', 'test123') ON CONFLICT DO NOTHING;
