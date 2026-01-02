@@ -19,17 +19,26 @@ pipeline {
 
         stage('Compile Backend for SonarQube') {
             steps {
-                dir('backend') {
+                script {
                     sh '''
                         echo "Compiling Java backend with Maven for SonarQube analysis..."
+                        
+                        # Get absolute path to backend directory
+                        WORKSPACE_PATH="${WORKSPACE}/backend"
+                        echo "Workspace path: $WORKSPACE_PATH"
+                        
+                        # Check if pom.xml exists
+                        ls -la "${WORKSPACE}/backend/pom.xml"
+                        
+                        # Run Maven compile
                         docker run --rm \
-                          -v $(pwd):/app \
+                          -v "${WORKSPACE_PATH}":/app \
                           -w /app \
                           maven:3.9.6-eclipse-temurin-17 \
                           mvn clean compile -DskipTests
                         
                         echo "✅ Backend compiled successfully"
-                        ls -lah target/classes || echo "No classes directory yet"
+                        ls -lah "${WORKSPACE}/backend/target/classes" || echo "Checking classes..."
                     '''
                 }
             }
