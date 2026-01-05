@@ -17,13 +17,16 @@ pipeline {
             steps {
                 script {
                     def scannerHome = tool 'SonarScanner'
-                    withSonarQubeEnv('SonarQube') {
-                        sh """
-                            ${scannerHome}/bin/sonar-scanner \
-                            -Dsonar.projectKey=devsecops-login \
-                            -Dsonar.sources=frontend \
-                            -Dsonar.exclusions=**/node_modules/**,**/backend/**,**/k8s-yaml/**
-                        """
+                    withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                        withSonarQubeEnv('SonarQube') {
+                            sh """
+                                ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=devsecops-login \
+                                -Dsonar.sources=frontend \
+                                -Dsonar.exclusions=**/node_modules/**,**/backend/**,**/k8s-yaml/** \
+                                -Dsonar.login=\${SONAR_TOKEN}
+                            """
+                        }
                     }
                 }
             }
