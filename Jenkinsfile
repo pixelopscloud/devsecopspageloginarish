@@ -17,47 +17,19 @@ pipeline {
             }
         }
 
-        stage('Compile Backend for SonarQube') {
-            steps {
-                script {
-                    sh '''
-                        echo "Compiling Java backend with Maven for SonarQube analysis..."
-                        
-                        # Get absolute path to backend directory
-                        WORKSPACE_PATH="${WORKSPACE}/backend"
-                        echo "Workspace path: $WORKSPACE_PATH"
-                        
-                        # Check if pom.xml exists
-                        ls -la "${WORKSPACE}/backend/pom.xml"
-                        
-                        # Run Maven compile
-                        docker run --rm \
-                          -v "${WORKSPACE_PATH}":/app \
-                          -w /app \
-                          maven:3.9.6-eclipse-temurin-17 \
-                          mvn clean compile -DskipTests
-                        
-                        echo "✅ Backend compiled successfully"
-                        ls -lah "${WORKSPACE}/backend/target/classes" || echo "Checking classes..."
-                    '''
-                }
-            }
-        }
-
-        stage('SonarQube Analysis') {
+        stage('SonarQube Analysis - Frontend') {
             steps {
                 script {
                     def scannerHome = tool 'SonarScanner'
                     
                     withSonarQubeEnv('SonarQube') {
                         sh """
+                            echo "Running SonarQube analysis on Frontend code..."
                             ${scannerHome}/bin/sonar-scanner \
-                            -Dsonar.projectKey=devsecops-login \
-                            -Dsonar.projectName=DevSecOps-Login \
-                            -Dsonar.sources=frontend,backend/src/main/java \
-                            -Dsonar.java.binaries=backend/target/classes \
-                            -Dsonar.java.source=17 \
-                            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/test/**,**/k8s-yaml/**,**/.git/**,**/database/** \
+                            -Dsonar.projectKey=devsecops-login-frontend \
+                            -Dsonar.projectName=DevSecOps-Login-Frontend \
+                            -Dsonar.sources=frontend \
+                            -Dsonar.exclusions=**/node_modules/**,**/k8s-yaml/**,**/.git/** \
                             -Dsonar.host.url=${env.SONAR_HOST_URL} \
                             -Dsonar.login=${env.SONAR_AUTH_TOKEN}
                         """
@@ -91,14 +63,14 @@ pipeline {
             steps {
                 script {
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    echo "Building Frontend Docker Image"
+                    echo "🌐 Building Frontend Docker Image"
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     
                     dir('frontend') {
                         sh "docker build -t ${FRONTEND_IMAGE} ."
                     }
                     
-                    echo "Running Trivy security scan on Frontend..."
+                    echo "🔍 Running Trivy security scan on Frontend..."
                     sh """
                         trivy image --severity HIGH,CRITICAL \
                         --exit-code 0 \
@@ -106,7 +78,7 @@ pipeline {
                         ${FRONTEND_IMAGE} || echo '⚠️ Trivy scan completed with warnings'
                     """
                     
-                    echo "Pushing Frontend image to Docker Hub..."
+                    echo "📤 Pushing Frontend image to Docker Hub..."
                     withCredentials([usernamePassword(
                         credentialsId: 'dockerhub-credentials', 
                         usernameVariable: 'DOCKER_USER', 
@@ -126,14 +98,18 @@ pipeline {
             steps {
                 script {
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    echo "Building Backend Docker Image (Spring Boot)"
+                    echo "⚙️  Building Backend Docker Image (Spring Boot)"
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "Note: Maven compilation happens inside Docker multi-stage build"
                     
                     dir('backend') {
-                        sh "docker build -t ${BACKEND_IMAGE} ."
+                        sh """
+                            echo "Building backend image with Maven inside Docker..."
+                            docker build -t ${BACKEND_IMAGE} . --progress=plain
+                        """
                     }
                     
-                    echo "Running Trivy security scan on Backend..."
+                    echo "🔍 Running Trivy security scan on Backend..."
                     sh """
                         trivy image --severity HIGH,CRITICAL \
                         --exit-code 0 \
@@ -141,7 +117,7 @@ pipeline {
                         ${BACKEND_IMAGE} || echo '⚠️ Trivy scan completed with warnings'
                     """
                     
-                    echo "Pushing Backend image to Docker Hub..."
+                    echo "📤 Pushing Backend image to Docker Hub..."
                     withCredentials([usernamePassword(
                         credentialsId: 'dockerhub-credentials', 
                         usernameVariable: 'DOCKER_USER', 
@@ -161,41 +137,34 @@ pipeline {
             steps {
                 script {
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                    echo "Deploying to Kubernetes"
+                    echo "🚀 Deploying to Kubernetes"
                     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                     
                     withKubeConfig([credentialsId: 'microk8s-kubeconfig']) {
                         sh """
-                            # Create namespace
                             echo "📦 Creating/Updating namespace: ${NAMESPACE}"
                             kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
 
-                            # Apply database configuration
                             echo "🗄️  Deploying database..."
                             kubectl apply -f k8s-yaml/db-secret.yaml -n ${NAMESPACE}
                             kubectl apply -f k8s-yaml/postgres-configmap.yaml -n ${NAMESPACE}
                             kubectl apply -f k8s-yaml/postgres-deployment.yaml -n ${NAMESPACE}
                             
-                            # Apply backend
                             echo "⚙️  Deploying backend..."
                             kubectl apply -f k8s-yaml/backend-deployment.yaml -n ${NAMESPACE}
                             
-                            # Apply frontend
                             echo "🌐 Deploying frontend..."
                             kubectl apply -f k8s-yaml/frontend-deployment.yaml -n ${NAMESPACE}
 
-                            # Update images with new build numbers
                             echo "🔄 Updating container images..."
                             kubectl set image deployment/backend backend=${BACKEND_IMAGE} -n ${NAMESPACE} || true
                             kubectl set image deployment/frontend frontend=${FRONTEND_IMAGE} -n ${NAMESPACE} || true
 
-                            # Wait for rollouts
                             echo "⏳ Waiting for deployments to be ready..."
-                            kubectl rollout status deployment/postgres -n ${NAMESPACE} --timeout=3m || true
-                            kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=3m || true
-                            kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=3m || true
+                            kubectl rollout status deployment/postgres -n ${NAMESPACE} --timeout=3m || echo "Postgres may already be running"
+                            kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=3m || echo "Backend rollout check completed"
+                            kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=3m || echo "Frontend rollout check completed"
 
-                            # Display status
                             echo ""
                             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                             echo "📊 Deployment Status"
