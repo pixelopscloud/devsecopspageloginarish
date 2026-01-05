@@ -1,0 +1,261 @@
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven'  // Make sure Maven is configured in Jenkins
+    }
+
+    environment {
+        NAMESPACE = "devsecops-login"
+        FRONTEND_IMAGE = "pixelopscloud/devsecops-frontend:${BUILD_NUMBER}"
+        BACKEND_IMAGE = "pixelopscloud/devsecops-backend:${BUILD_NUMBER}"
+        ZAP_TARGET = "http://frontend-service.${NAMESPACE}.svc.cluster.local"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main', 
+                    credentialsId: 'github-credentials', 
+                    url: 'https://github.com/pixelopscloud/devsecopspageloginarish.git'
+            }
+        }
+
+        stage('Build Backend (Maven)') {
+            steps {
+                dir('backend') {
+                    sh '''
+                        echo "Building Java backend with Maven..."
+                        mvn clean package -DskipTests
+                    '''
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                script {
+                    def scannerHome = tool 'SonarScanner'
+                    
+                    // Build backend first for SonarQube
+                    dir('backend') {
+                        sh 'mvn clean compile'
+                    }
+                    
+                    withSonarQubeEnv('SonarQube') {
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                            -Dsonar.projectKey=devsecops-login \
+                            -Dsonar.projectName=DevSecOps-Login \
+                            -Dsonar.sources=frontend,backend/src/main/java \
+                            -Dsonar.java.binaries=backend/target/classes \
+                            -Dsonar.exclusions=**/node_modules/**,**/target/**,**/test/**,**/k8s-yaml/**,**/.git/** \
+                            -Dsonar.java.source=11 \
+                            -Dsonar.host.url=${env.SONAR_HOST_URL} \
+                            -Dsonar.login=${env.SONAR_AUTH_TOKEN}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    script {
+                        try {
+                            def qg = waitForQualityGate()
+                            if (qg.status != 'OK') {
+                                echo "⚠️ Quality Gate failed: ${qg.status}"
+                                echo "Continuing with build despite Quality Gate failure..."
+                            } else {
+                                echo "✅ Quality Gate passed!"
+                            }
+                        } catch (Exception e) {
+                            echo "⚠️ Quality Gate check failed: ${e.message}"
+                            echo "Continuing with build..."
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Frontend') {
+            steps {
+                script {
+                    dir('frontend') {
+                        sh "docker build -t ${FRONTEND_IMAGE} ."
+                    }
+                    
+                    echo "Running Trivy security scan on Frontend..."
+                    sh """
+                        trivy image --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --no-progress \
+                        ${FRONTEND_IMAGE} || echo '⚠️ Trivy scan completed with warnings'
+                    """
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-credentials', 
+                        usernameVariable: 'DOCKER_USER', 
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                            docker push ${FRONTEND_IMAGE}
+                            echo "✅ Frontend image pushed: ${FRONTEND_IMAGE}"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Backend') {
+            steps {
+                script {
+                    dir('backend') {
+                        sh "docker build -t ${BACKEND_IMAGE} ."
+                    }
+                    
+                    echo "Running Trivy security scan on Backend..."
+                    sh """
+                        trivy image --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --no-progress \
+                        ${BACKEND_IMAGE} || echo '⚠️ Trivy scan completed with warnings'
+                    """
+                    
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-credentials', 
+                        usernameVariable: 'DOCKER_USER', 
+                        passwordVariable: 'DOCKER_PASS'
+                    )]) {
+                        sh """
+                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
+                            docker push ${BACKEND_IMAGE}
+                            echo "✅ Backend image pushed: ${BACKEND_IMAGE}"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    withKubeConfig([credentialsId: 'microk8s-kubeconfig']) {
+                        sh """
+                            echo "Deploying to Kubernetes namespace: ${NAMESPACE}"
+                            
+                            # Create namespace if not exists
+                            kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+                            # Apply all YAMLs in order
+                            echo "Applying Kubernetes manifests..."
+                            kubectl apply -f k8s-yaml/db-secret.yaml -n ${NAMESPACE}
+                            kubectl apply -f k8s-yaml/postgres-configmap.yaml -n ${NAMESPACE}
+                            kubectl apply -f k8s-yaml/postgres-deployment.yaml -n ${NAMESPACE}
+                            kubectl apply -f k8s-yaml/backend-deployment.yaml -n ${NAMESPACE}
+                            kubectl apply -f k8s-yaml/frontend-deployment.yaml -n ${NAMESPACE}
+
+                            # Update images with new build tags
+                            echo "Updating deployment images..."
+                            kubectl set image deployment/backend backend=${BACKEND_IMAGE} -n ${NAMESPACE}
+                            kubectl set image deployment/frontend frontend=${FRONTEND_IMAGE} -n ${NAMESPACE}
+
+                            # Wait for deployments to be ready
+                            echo "Waiting for deployments to be ready..."
+                            kubectl rollout status deployment/backend -n ${NAMESPACE} --timeout=3m || true
+                            kubectl rollout status deployment/frontend -n ${NAMESPACE} --timeout=3m || true
+
+                            # Show deployment status
+                            echo "=== Deployment Status ==="
+                            kubectl get pods -n ${NAMESPACE}
+                            echo ""
+                            echo "=== Services ==="
+                            kubectl get svc -n ${NAMESPACE}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('OWASP ZAP Baseline Scan') {
+            steps {
+                script {
+                    echo "Running OWASP ZAP Baseline Scan..."
+                    sh """
+                        docker run -t --rm \
+                          --network host \
+                          -v \$(pwd):/zap/wrk/:rw \
+                          ghcr.io/zaproxy/zaproxy:stable \
+                          zap-baseline.py -t ${ZAP_TARGET} \
+                          -r baseline-report.html \
+                          -I \
+                          || echo '⚠️ ZAP Baseline scan completed with findings'
+                    """
+                }
+            }
+        }
+
+        stage('OWASP ZAP Full Scan') {
+            steps {
+                script {
+                    echo "Running OWASP ZAP Full Scan..."
+                    sh """
+                        docker run -t --rm \
+                          --network host \
+                          -v \$(pwd):/zap/wrk/:rw \
+                          ghcr.io/zaproxy/zaproxy:stable \
+                          zap-full-scan.py -t ${ZAP_TARGET} \
+                          -r full-report.html \
+                          -I \
+                          || echo '⚠️ ZAP Full scan completed with findings'
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // Archive reports if they exist
+            archiveArtifacts artifacts: '*.html', allowEmptyArchive: true
+            
+            // Publish HTML reports
+            publishHTML([
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: '.',
+                reportFiles: 'baseline-report.html, full-report.html',
+                reportName: 'OWASP ZAP Security Reports'
+            ])
+        }
+        
+        success {
+            echo '========================================='
+            echo '✅ Pipeline completed successfully!'
+            echo '========================================='
+            echo "Frontend Image: ${FRONTEND_IMAGE}"
+            echo "Backend Image: ${BACKEND_IMAGE}"
+            echo "Namespace: ${NAMESPACE}"
+            echo '========================================='
+        }
+        
+        failure {
+            echo '========================================='
+            echo '❌ Pipeline failed! Check logs above.'
+            echo '========================================='
+        }
+        
+        cleanup {
+            // Clean up local Docker images to save space
+            sh """
+                echo "Cleaning up Docker images and cache..."
+                docker rmi ${FRONTEND_IMAGE} ${BACKEND_IMAGE} || true
+                docker system prune -f || true
+            """
+        }
+    }
+}
